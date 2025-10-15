@@ -1,0 +1,18 @@
+services:
+  autoshift:
+    build: .
+    container_name: autoshift
+    restart: unless-stopped
+    env_file:
+      - .env   # optional, can override defaults
+    environment:
+      - SHIFT_DATA_DIR=/data
+      - SHIFT_COOKIE_FILE=/data/.cookies.save
+      - SHIFT_DB_FILE=/data/keys.db
+    volumes:
+      - autoshift_data:/data
+    ports:
+      - "8080:8080"
+
+volumes:
+  autoshift_data:
