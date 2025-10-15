@@ -41,12 +41,12 @@ uv run autoshift --help
 
 - redeem codes for Borderlands 4 on Steam (and keep redeeming every 2 hours)
 ```sh
-uv run autoshift schedule --game bl4 --platform steam
+uv run autoshift schedule --bl4=steam
 ```
 
 - redeem codes for Borderlands 4 on Steam using Username and Password (Use quotes for User and Password)
 ```sh
-uv run autoshift schedule --game bl4 --platform steam --user "my@user.edu" --pass "p4ssw0rd!123"
+uv run autoshift schedule --bl4=steam --user "my@user.edu" --pass "p4ssw0rd!123"
 ```
 
 - redeem a single code
@@ -74,15 +74,26 @@ Available as a docker image based on `python3.12-alpine`
 All command-line arguments can be used just like running the script directly
 
 ```
-docker run --rm --name autoshift \
+  docker run --name autoshift \
   --restart=always \
   -v autoshift:/autoshift/data \
-  fabianschweinfurth/autoshift:latest schedule --user="<username>" --pw="<password>" --bl4=steam
+  fabianschweinfurth/autoshift:latest schedule --user="<username>" --pass="<password>" --bl4=steam
 ```
 
+Or with docker-compose:
+
 ```
-docker run --rm --name autoshift \
-  --restart=always \
-  -v autoshift:/autoshift/data \
-  fabianschweinfurth/autoshift:latest schedule --user="<username>" --pw="<password>" --bl4=steam
+services:
+  autoshift:
+    container_name: autoshift
+    restart: always
+    volumes:
+      - ./autoshift:/autoshift/data
+    image: fabianschweinfurth/autoshift:latest
+    command: schedule --user="<username>" --pass="<password>" --bl4=steam
+volumes:
+  autoshift:
+    external: true
+    name: autoshift
+networks: {}
 ```

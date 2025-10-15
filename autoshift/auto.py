@@ -24,15 +24,19 @@ import json
 import logging
 import os
 import re
-from collections.abc import Sequence
+import sys
+from collections.abc import Callable, Sequence
 from enum import Enum
 from typing import (
     TYPE_CHECKING,
     Annotated,
+    cast,
 )
 
+import click
 import httpx
 import typer
+from pydantic import SecretStr
 from typer import Typer
 
 from autoshift import storage
@@ -51,7 +55,7 @@ under certain conditions; see LICENSE for details.
 """
 
 
-app = Typer(help="AutoSHiFt: Automatically redeem Gearbox SHiFT Codes")
+app = Typer(help="AutoSHiFT: Automatically redeem Gearbox SHiFT Codes")
 
 client: ShiftClient = ShiftClient()
 
@@ -101,7 +105,7 @@ def clean_key_data(key_data: Sequence[dict]):
             yield data
 
 
-def query_keys(game_map: dict[Game, list[Platform]]) -> list[Key]:
+def query_keys(game_map: dict[Game, set[Platform]]) -> list[Key]:
     """Query new keys for given games and platforms
 
     Returns dict of dicts of lists with [game][platform] as keys"""
@@ -124,17 +128,47 @@ def query_keys(game_map: dict[Game, list[Platform]]) -> list[Key]:
     return new_keys
 
 
+PlatformArg = Enum("Platform", [(p.name, p.value) for p in Platform] + [("all", "all")])
+
+
 @app.callback()
 def callback(
+    ctx: typer.Context,
+    bl1: Annotated[
+        list[PlatformArg] | None, typer.Option(rich_help_panel="Platform Selection")
+    ] = None,
+    bl2: Annotated[
+        list[PlatformArg] | None, typer.Option(rich_help_panel="Platform Selection")
+    ] = None,
+    bl3: Annotated[
+        list[PlatformArg] | None, typer.Option(rich_help_panel="Platform Selection")
+    ] = None,
+    bl4: Annotated[
+        list[PlatformArg] | None, typer.Option(rich_help_panel="Platform Selection")
+    ] = None,
+    blps: Annotated[
+        list[PlatformArg] | None, typer.Option(rich_help_panel="Platform Selection")
+    ] = None,
+    ttw: Annotated[
+        list[PlatformArg] | None, typer.Option(rich_help_panel="Platform Selection")
+    ] = None,
+    gdfll: Annotated[
+        list[PlatformArg] | None, typer.Option(rich_help_panel="Platform Selection")
+    ] = None,
     games: Annotated[
         list[Game] | None,
-        typer.Option("--game", help="Games you want to query SHiFT keys for"),
+        typer.Option(
+            "--game",
+            help="Games you want to query SHiFT keys for",
+            rich_help_panel="Global Options",
+        ),
     ] = None,
     platforms: Annotated[
         list[Platform] | None,
         typer.Option(
             "--platforms",
             help="Platforms you want to query SHiFT keys for",
+            rich_help_panel="Global Options",
         ),
     ] = None,
     user: Annotated[
@@ -143,6 +177,7 @@ def callback(
             "--user",
             "-u",
             help="User login (optional, will prompt if not provided)",
+            rich_help_panel="Global Options",
         ),
     ] = None,
     password: Annotated[
@@ -151,46 +186,73 @@ def callback(
             "--pass",
             "-p",
             help="Password for your login (optional, will prompt if not provided)",
+            rich_help_panel="Global Options",
         ),
     ] = None,
     verbose: Annotated[
-        bool, typer.Option("--verbose", "-v", help="Enable verbose mode")
+        bool,
+        typer.Option(
+            "--verbose",
+            "-v",
+            help="Enable verbose mode",
+            rich_help_panel="Global Options",
+        ),
     ] = False,
 ):
-    if not user:
-        user = settings.USER
+    if "--help" in sys.argv or "-h" in sys.argv:
+        # shortcircuit
+        return
 
-    if not password and settings.PASS:
-        password = settings.PASS.get_secret_value()
+    if TYPE_CHECKING:
+        _silence_unused = (bl1, bl2, bl3, bl4, blps, ttw, gdfll)
 
-    if games:
-        settings.GAMES = games
+    if user:
+        settings.USER = user
+
+    if password:
+        settings.PASS = SecretStr(password)
+
     if platforms:
         settings.PLATFORMS = platforms
+
+        if games:
+            settings.GAMES = games
+            for game in games:
+                settings._GAMES_PLATFORM_MAP[game].update(platforms)
+
+    for game in Game:
+        value = locals().get(game.name)
+        if value is None:
+            continue
+        if any(v == PlatformArg.all for v in value):  # pyright: ignore[reportAttributeAccessIssue]
+            value = list(Platform)
+        settings._GAMES_PLATFORM_MAP[game].update(value)
 
     # Set up logging
     if verbose:
         _L.setLevel(logging.DEBUG)
-        for handler in _L.handlers:
-            handler.setLevel(logging.DEBUG)
         _L.debug("Debug mode on")
+
+    if not hasattr(ctx, "__run_command"):
+        return
 
     # Check for first-time usage
     if not settings.COOKIE_FILE.exists():
         typer.echo(LICENSE_TEXT)
 
-    # try logging in first. Does nothing if already logged in
-    client.login(user, password)
-
     from autoshift.storage import database
 
-    database.connect()
-    run_migrations(database)
+    if database.is_closed():
+        database.connect()
+        run_migrations(database)
+
+    # try logging in first. Does nothing if already logged in
+    client.login(
+        settings.USER, settings.PASS.get_secret_value() if settings.PASS else None
+    )
 
 
-@app.command(
-    "redeem", context_settings=dict(allow_extra_args=True, ignore_unknown_options=True)
-)
+@app.command("redeem")
 def redeem_one(
     platform: Annotated[Platform, typer.Argument()],
     code: Annotated[str, typer.Argument()],
@@ -209,27 +271,14 @@ def redeem_one(
     redeem(db_key)
 
 
-# PlatformArg = Literal[[p.name for p in Platform] + ["all"]]
-PlatformArg = Enum("Platform", [(p.name, p.value) for p in Platform] + [("all", "all")])
-
-
-@app.command(
-    "schedule",
-)
+@app.command("schedule")
 def auto_redeem_codes(
-    bl1: Annotated[list[PlatformArg] | None, typer.Option()] = None,
-    bl2: Annotated[list[PlatformArg] | None, typer.Option()] = None,
-    bl3: Annotated[list[PlatformArg] | None, typer.Option()] = None,
-    bl4: Annotated[list[PlatformArg] | None, typer.Option()] = None,
-    blps: Annotated[list[PlatformArg] | None, typer.Option()] = None,
-    ttw: Annotated[list[PlatformArg] | None, typer.Option()] = None,
-    gdfll: Annotated[list[PlatformArg] | None, typer.Option()] = None,
     interval: Annotated[
-        int,
+        int | None,
         typer.Option(
             help="Keep checking for keys every N minutes (minimum 120)",
         ),
-    ] = 120,
+    ] = None,
     limit: Annotated[
         int | None,
         typer.Option(
@@ -241,22 +290,9 @@ def auto_redeem_codes(
     ] = None,
 ):
     """Redeem SHiFT codes for specified games and platforms."""
-    if TYPE_CHECKING:
-        _silence_unused = (bl1, bl2, bl3, bl4, blps, ttw, gdfll)
 
-    game_platform_map: dict[Game, list[Platform]] = {}
-    for game in Game:
-        value = locals().get(game.name)
-        if value is None:
-            continue
-        if any(v == PlatformArg.all for v in value):  # pyright: ignore[reportAttributeAccessIssue]
-            value = list(Platform)
-        game_platform_map[game] = value
-
-    if game_platform_map:
-        settings._GAMES_PLATFORM_MAP.update(game_platform_map)
-
-    settings.SCHEDULE = interval
+    if interval:
+        settings.SCHEDULE = interval
 
     if limit:
         settings.LIMIT = limit
@@ -286,6 +322,11 @@ def auto_redeem_codes(
     _L.info("Goodbye.")
 
 
+@app.command("query")
+def query():
+    query_keys(settings._GAMES_PLATFORM_MAP)
+
+
 def main():
     from time import sleep
 
@@ -307,5 +348,43 @@ def main():
     _L.info("No more keys left!")
 
 
+click_app = cast(click.Group, typer.main.get_command(app))
+
+
+def wrap(command: click.Command, cb: click.Command) -> click.Command:
+    orig_cb = cast(Callable, command.callback)
+
+    cmd_kwarg_names = {opt.name for opt in command.params}
+
+    cb_kwarg_names = {opt.name for opt in cb.params}
+
+    def new_callback(*args, **kwargs):
+        ctx = click.get_current_context()
+        setattr(ctx, "__run_command", True)
+        cb_kwargs: dict = {}
+        cmd_kwargs: dict = {}
+        for k, v in kwargs.items():
+            if k in cb_kwarg_names:
+                cb_kwargs[k] = v
+            if k in cmd_kwarg_names:
+                cmd_kwargs[k] = v
+        if cb.callback:
+            cb.callback(**cb_kwargs)
+        return orig_cb(*args, **cmd_kwargs)
+
+    command.callback = new_callback
+    command.params.extend(reversed(cb.params))
+    return command
+
+
+for name, cmd in click_app.commands.items():
+    click_app.commands[name] = wrap(cmd, click_app)
+
+
+def run():
+    click_app()
+    client.__save_cookie()
+
+
 if __name__ == "__main__":
-    app()
+    run()

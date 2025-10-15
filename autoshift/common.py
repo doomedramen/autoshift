@@ -22,6 +22,7 @@
 import logging
 import logging.config
 import re
+from collections import defaultdict
 from enum import StrEnum, auto
 from pathlib import Path
 from typing import Annotated, Any, Literal, override
@@ -75,20 +76,11 @@ def path(v: str):
     return v and Path(v)
 
 
-def list_string_to_list(value: str) -> list[str]:
-    value = value.removeprefix("[").removesuffix("]")
-    if "," in value:
-        lst = [p.strip() for p in value.split(",")]
-    else:
-        lst = [value.strip()]
-    return lst
-
-
 def validate_list(value):
     if not value:
         return []
     if isinstance(value, str):
-        return list_string_to_list(value)
+        return list(filter(len, re.split(r"\W+", value)))
     return value
 
 
@@ -117,8 +109,8 @@ class SettingsFields(BaseSettings):
         NoDecode,
     ] = []
 
-    _GAMES_PLATFORM_MAP: dict[Game, list[Platform]] = PrivateAttr(
-        init=False, default_factory=dict
+    _GAMES_PLATFORM_MAP: dict[Game, set[Platform]] = PrivateAttr(
+        init=False, default_factory=lambda: defaultdict(set)
     )
 
     USER: str | None = Field(
@@ -162,9 +154,10 @@ class SettingsFields(BaseSettings):
                       |  Set this to `None` to disable querying new keys.""",
     )
 
-    def write_defaults_file(self):
+    @staticmethod
+    def write_defaults_file():
         with (ROOT_DIR / "env.default").open("w") as f:
-            f.write("# -*- mode: shell -*-\n\n")
+            f.write("# -*- mode: sh -*-\n\n")
             default_settings = SettingsFields().model_dump()
 
             default_settings["COOKIE_FILE"] = "${SHIFT_DATA_DIR}/.cookies.save"
@@ -212,6 +205,7 @@ class Settings(SettingsFields):
         env_prefix="SHIFT_",
         env_file_encoding="utf-8",
         env_ignore_empty=True,
+        env_parse_none_str="None",
         extra="allow",
     )
 
@@ -221,10 +215,7 @@ class Settings(SettingsFields):
         self.COOKIE_FILE.parent.mkdir(parents=True, exist_ok=True)
         self.DB_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-        if self.SHIFT_SOURCE and not (
-            self.SHIFT_SOURCE.startswith("http://")
-            or self.SHIFT_SOURCE.startswith("https://")
-        ):
+        if self.SHIFT_SOURCE and not self.SHIFT_SOURCE.startswith("http"):
             path = Path(self.SHIFT_SOURCE)
             if not path.is_absolute():
                 path = ROOT_DIR / path
@@ -234,17 +225,17 @@ class Settings(SettingsFields):
         logging.getLogger("autoshift").addHandler(handler)
 
         for game in self.GAMES:
-            self._GAMES_PLATFORM_MAP[game] = self.PLATFORMS.copy()
+            self._GAMES_PLATFORM_MAP[game] = set(self.PLATFORMS)
 
         if not self.model_extra:
             return
 
         for game in Game:
             if platforms := self.model_extra.get(f"shift_{game.name.lower()}"):
-                platforms = list_string_to_list(platforms)
-                self._GAMES_PLATFORM_MAP[game] = [
+                platforms = validate_list(platforms)
+                self._GAMES_PLATFORM_MAP[game] = set(
                     Platform(platform) for platform in platforms
-                ]
+                )
 
         return
 
@@ -288,4 +279,6 @@ logging.config.dictConfig(
 )
 
 _L = logging.getLogger("autoshift")
-_L.setLevel(settings.LOG_LEVEL)
+
+if __name__ == "__main__":
+    SettingsFields.write_defaults_file()

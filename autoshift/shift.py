@@ -21,6 +21,7 @@
 #############################################################################
 
 import pickle
+import time
 from enum import Enum
 from typing import Any, Literal
 
@@ -83,11 +84,13 @@ class ShiftClient:
     logged_in: bool = False
 
     def __init__(self):
-        self.client = httpx.Client(follow_redirects=True)
         # try to load cookies. Query for login data if not present
-        self.logged_in = self.__load_cookie()
+        self.cookies = self.__load_cookie()
+        self.client = httpx.Client(follow_redirects=True, cookies=self.cookies)
 
     def login(self, user: str | None = None, pw: str | None = None):
+        if self.cookies:
+            self.logged_in = self.check_login()
         if self.logged_in:
             return True
         typer.echo("Login to your SHiFT account...")
@@ -105,28 +108,40 @@ class ShiftClient:
             _L.error("Couldn't login. Are your credentials correct?")
             exit(0)
 
+    def check_login(self) -> bool:
+        response = self.client.get(f"{base_url}/rewards")
+        return response.status_code == 200 and "Sign Out" in response.text
+
     def __save_cookie(self) -> bool:
         """Make ./data folder if not present"""
         if not settings.COOKIE_FILE.parent.exists():
             settings.COOKIE_FILE.parent.mkdir(parents=True, exist_ok=True)
 
+        self.client.cookies.jar.clear_expired_cookies()
+
         """Save cookie for auto login"""
         with settings.COOKIE_FILE.open("wb") as f:
             if "si" in self.client.cookies:
-                pickle.dump(dict(self.client.cookies), f)
+                pickle.dump(self.client.cookies.jar._cookies, f)  # pyright: ignore[reportAttributeAccessIssue]
                 return True
         return False
 
-    def __load_cookie(self) -> bool:
+    def __load_cookie(self) -> httpx.Cookies | None:
         """Check if there is a saved cookie and load it."""
-        if not settings.COOKIE_FILE.exists():
-            return False
-        with settings.COOKIE_FILE.open("rb") as f:
-            content = f.read()
-            if not content:
-                return False
-            self.client.cookies.update(pickle.loads(content))
-        return True
+        if not settings.COOKIE_FILE.exists() or settings.COOKIE_FILE.stat().st_size == 0:
+            return None
+        try:
+            cookies = httpx.Cookies()
+            with settings.COOKIE_FILE.open("rb") as f:
+                jar_cookies = pickle.load(f)
+                for domain, pc in jar_cookies.items():
+                    for path, c in pc.items():
+                        for k, v in c.items():
+                            cookies.set(k, v.value, domain=domain, path=path)
+            return cookies
+        except Exception:
+            _L.error("Could not load cookies. Re-login required")
+            return None
 
     def redeem(self, key: Key) -> Status:
         from time import sleep
@@ -149,6 +164,8 @@ class ShiftClient:
                 elif "expired" in form_data:
                     status = Status.EXPIRED
                 elif "not available" in form_data:
+                    status = Status.INVALID
+                elif "does not exist" in form_data:
                     status = Status.INVALID
                 elif "already been redeemed" in form_data:
                     status = Status.REDEEMED
@@ -212,7 +229,7 @@ class ShiftClient:
     ) -> tuple[Literal[False], int, str] | tuple[Literal[True], int, dict[str, str]]:
         """Get Form data for code redemption"""
 
-        the_url = f"{base_url}/code_redemptions/new"
+        the_url = f"{base_url}/rewards"
         status_code, token = self.__get_token(the_url)
         if not token:
             _L.debug("no token")
@@ -334,19 +351,43 @@ class ShiftClient:
         """Redeem a code with given form data"""
 
         the_url = f"{base_url}/code_redemptions"
-        headers = {"Referer": f"{the_url}/new"}
-        r = self.client.post(the_url, data=data, headers=headers, follow_redirects=False)
-        _L.debug(f"{r.request.method} {r.url} {r.status_code}")
-        status = self.__check_redemption_status(r)
+        headers = {"Referer": f"{base_url}/rewards"}
+        response = self.client.post(
+            the_url, data=data, headers=headers, follow_redirects=False
+        )
+        _L.debug(f"{response.request.method} {response.url} {response.status_code}")
+        status = self.__check_redemption_status(response)
         # did we visit /code_redemptions/...... route?
         redemption = False
         # keep following redirects
         while status == Status.REDIRECT:
             if "code_redemptions/" in status.value:
                 redemption = True
-            _L.debug(f"redirect to '{status.value}'")
-            r2 = self.client.get(status.value)
-            status = self.__check_redemption_status(r2)
+                while True:
+                    response2 = self.client.get(
+                        status.value,
+                        headers={
+                            "referer": status.value,
+                            "x-requested-with": "XMLHttpRequest",
+                            "accept": "application/json",
+                        },
+                    )
+                    json_data = response2.json()
+                    if json_data.get("in_progress", False):
+                        time.sleep(0.5)
+                        continue
+                    try:
+                        status = self.__get_status(json_data["text"])
+                    except KeyError as e:
+                        _L.error("Unexpected JSON response. Please report this issue!")
+                        _L.error(f"JSON data: {json_data}")
+                        raise e
+                    break
+
+            else:
+                _L.debug(f"redirect to '{status.value}'")
+                response2 = self.client.get(status.value)
+                status = self.__check_redemption_status(response2)
 
         # workaround for new SHiFT website.
         # it doesn't tell you to launch a "SHiFT-enabled title" anymore
